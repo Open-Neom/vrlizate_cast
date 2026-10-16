@@ -1,0 +1,19 @@
+name: vrlizate_cast
+description: Optional, low-rate LAN spectator preview for VRlizate, independent of controller transport.
+version: 0.1.0-beta.1
+publish_to: none
+
+environment:
+  sdk: ^3.10.0
+  flutter: ">=3.44.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  image: ^4.9.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
