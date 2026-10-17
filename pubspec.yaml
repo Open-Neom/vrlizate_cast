@@ -1,7 +1,8 @@
 name: vrlizate_cast
-description: Optional, low-rate LAN spectator preview for VRlizate, independent of controller transport.
-version: 0.1.0-beta.1
-publish_to: none
+description: Demand-driven LAN spectator preview, quality presets, PIN access policies, and telemetry for VRlizate, independent of controller transport.
+version: 1.0.0
+homepage: https://github.com/Open-Neom/vrlizate_cast
+repository: https://github.com/Open-Neom/vrlizate_cast
 
 environment:
   sdk: ^3.10.0
@@ -16,4 +17,3 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
-

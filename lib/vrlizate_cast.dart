@@ -1,7 +1,16 @@
 library;
 
-export 'src/vr_cast_host.dart';
-export 'src/vr_cast_models.dart';
-export 'src/vr_cast_preview.dart';
-export 'src/vr_cast_session.dart';
-export 'src/vr_cast_surface.dart';
+export 'domain/models/vr_cast_access_policy.dart';
+export 'domain/models/vr_cast_session.dart';
+export 'domain/models/vr_cast_source_handle.dart';
+export 'domain/models/vr_cast_stats.dart';
+export 'domain/models/vr_cast_telemetry_snapshot.dart';
+export 'domain/services/vr_cast_host.dart';
+export 'ui/vr_cast_boundary.dart';
+export 'ui/vr_cast_preview.dart';
+export 'ui/vr_cast_surface.dart';
+export 'ui/vr_render_cast_boundary.dart';
+export 'utils/constants/vr_cast_constants.dart' show VrCastConstants;
+export 'utils/constants/vr_cast_translation_constants.dart';
+export 'utils/enums/vr_cast_eye.dart';
+export 'utils/enums/vr_cast_quality_preset.dart';
