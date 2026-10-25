@@ -1,0 +1,4 @@
+# Keep SDK development/tests on the same reproducible capture fork as the app.
+dependency_overrides:
+  flutter_webrtc:
+    path: third_party/flutter_webrtc

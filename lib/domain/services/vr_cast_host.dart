@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 
 import '../../utils/constants/vr_cast_constants.dart';
 import '../../utils/constants/vr_cast_translation_constants.dart';
+import '../../utils/constants/vr_cast_signaling_constants.dart';
 import '../../utils/enums/vr_cast_quality_preset.dart';
 import '../models/vr_cast_access_policy.dart';
 import '../models/vr_cast_request.dart';
@@ -15,9 +16,10 @@ import '../models/vr_cast_stats.dart';
 import '../models/vr_cast_telemetry_snapshot.dart';
 import 'vr_cast_server_transport.dart';
 import 'vr_cast_transport_factory.dart';
+import 'vr_cast_realtime_host.dart';
 
-/// Demand-driven, bounded LAN preview. This protocol sends JPEG images, not
-/// continuous audiovisual WebRTC. No frame producer runs without requests.
+/// Authenticated LAN cast: a bounded JPEG preview plus an optional, single
+/// WebRTC video session. The active immersive source owns capture admission.
 class VrCastHost extends ChangeNotifier {
   VrCastHost({
     int? frameWidth,
@@ -26,6 +28,7 @@ class VrCastHost extends ChangeNotifier {
     this.accessPolicy = const VrCastAccessPolicy.open(),
     this.captureTimeout = const Duration(seconds: 2),
     this.sessionLifetime = const Duration(hours: 1),
+    this.realtime,
     @visibleForTesting VrCastServerTransport Function()? createTransport,
   }) : frameWidth = frameWidth ?? qualityPreset.frameWidth,
        framesPerSecond = framesPerSecond ?? qualityPreset.framesPerSecond,
@@ -49,6 +52,7 @@ class VrCastHost extends ChangeNotifier {
   final VrCastAccessPolicy accessPolicy;
   final Duration captureTimeout;
   final Duration sessionLifetime;
+  final VrCastRealtimeHost? realtime;
   final VrCastServerTransport Function() _createTransport;
   final Stopwatch _clock = Stopwatch()..start();
   VrCastServerTransport? _server;
@@ -76,10 +80,15 @@ class VrCastHost extends ChangeNotifier {
   int _sequence = 0;
   Duration _lastDuration = Duration.zero;
   DateTime? _lastAt;
+  bool _sourceStereo = true;
 
   int get jpegQuality => qualityPreset.jpegQuality;
   bool get isRunning => _running;
   String? get error => _error;
+  bool get isAwaitingScreenCaptureConsent =>
+      realtime?.isAwaitingConsent ?? false;
+  Map<String, Object?> get realtimeDiagnostics =>
+      realtime?.diagnostics ?? const {'state': 'not-enabled'};
   List<Uri> get viewerUris => List.unmodifiable(_uris);
   Uri? get preferredViewerUri =>
       _running && _uris.isNotEmpty ? _uris.first : null;
@@ -104,12 +113,17 @@ class VrCastHost extends ChangeNotifier {
     fpsCap: framesPerSecond,
   );
 
-  VrCastSourceHandle registerSource(VrCastFrameProvider provider) {
+  VrCastSourceHandle registerSource(
+    VrCastFrameProvider provider, {
+    bool realtimeStereo = true,
+  }) {
     final handle = VrCastSourceHandle();
     if (_disposed) return handle;
     _source = handle;
     _provider = provider;
+    _sourceStereo = realtimeStereo;
     _invalidateSource();
+    realtime?.setSource(active: _running, stereo: _sourceStereo);
     return handle;
   }
 
@@ -121,6 +135,7 @@ class VrCastHost extends ChangeNotifier {
   }
 
   void _invalidateSource() {
+    realtime?.setSource(active: false, stereo: _sourceStereo);
     _sourceRevision++;
     _frame = null;
     _lastAt = null;
@@ -174,6 +189,7 @@ class VrCastHost extends ChangeNotifier {
       ];
       _sessionStartUs = _clock.elapsedMicroseconds;
       _running = true;
+      realtime?.setSource(active: _provider != null, stereo: _sourceStereo);
       _expiry = Timer(sessionLifetime, () => unawaited(stop()));
       notifyListeners();
     } catch (_) {
@@ -239,6 +255,10 @@ class VrCastHost extends ChangeNotifier {
         !_authorized(request.uri)) {
       return const VrCastResponse(403);
     }
+    if (request.uri.path == VrCastSignalingConstants.offerPath ||
+        request.uri.path == VrCastSignalingConstants.sessionPath) {
+      return _handleRealtime(request);
+    }
     if (request.method != VrCastConstants.methodGet) {
       return const VrCastResponse(405);
     }
@@ -268,8 +288,8 @@ class VrCastHost extends ChangeNotifier {
               VrCastConstants.keyBytes: _bytes,
               VrCastConstants.keyDropped: _dropped,
               VrCastConstants.keyErrors: _errors,
-              VrCastConstants.keyCaptureMs:
-                  _lastDuration.inMicroseconds / 1000,
+              VrCastConstants.keyCaptureMs: _lastDuration.inMicroseconds / 1000,
+              'realtime': realtimeDiagnostics,
             }),
           ),
         ),
@@ -326,6 +346,74 @@ class VrCastHost extends ChangeNotifier {
     }
   }
 
+  Future<VrCastResponse> _handleRealtime(VrCastRequest request) async {
+    final video = realtime;
+    if (video == null) return const VrCastResponse(501);
+    final offer = request.uri.path == VrCastSignalingConstants.offerPath;
+    if ((offer && request.method != 'POST') ||
+        (!offer && request.method != 'POST' && request.method != 'DELETE')) {
+      return const VrCastResponse(405);
+    }
+    if (request.contentType != 'application/json') {
+      return const VrCastResponse(415);
+    }
+    // URI authorization has already succeeded. The IO transport only begins
+    // its bounded body read here, never while processing an unauthorized URL.
+    final session = _session, revision = _sourceRevision;
+    final bytes = await request.readBody();
+    if (bytes.length > VrCastSignalingConstants.maxBodyBytes) {
+      return const VrCastResponse(413);
+    }
+    Map<String, dynamic> body;
+    try {
+      final decoded = jsonDecode(utf8.decode(bytes));
+      if (decoded is! Map<String, dynamic>) return const VrCastResponse(400);
+      body = decoded;
+    } catch (_) {
+      return const VrCastResponse(400);
+    }
+    if (!_running || session != _session) return const VrCastResponse(403);
+    try {
+      if (offer) {
+        if (_provider == null) {
+          return const VrCastResponse(
+            503,
+            headers: {'X-VRlizate-Video-State': 'source-unavailable'},
+          );
+        }
+        final answer = await video.acceptOffer(body);
+        if (!_running || session != _session ||
+            revision != _sourceRevision || _provider == null) {
+          final id = body['requestId'];
+          if (id is String) await video.release(id);
+          return const VrCastResponse(503);
+        }
+        return VrCastResponse(
+          200,
+          contentType: VrCastConstants.contentTypeJson,
+          bytes: Uint8List.fromList(utf8.encode(jsonEncode(answer))),
+        );
+      }
+      final id = body['sessionId'];
+      if (body.length != 1 ||
+          id is! String ||
+          !RegExp(VrCastSignalingConstants.sessionIdPattern).hasMatch(id)) {
+        return const VrCastResponse(400);
+      }
+      if (request.method == 'DELETE') {
+        await video.release(id);
+      } else {
+        video.keepAlive(id);
+      }
+      return const VrCastResponse(204);
+    } on VrCastRealtimeException catch (error) {
+      // No native error, SDP, URI or credential is returned to a viewer.
+      return VrCastResponse(error.statusCode);
+    } catch (_) {
+      return const VrCastResponse(503);
+    }
+  }
+
   Future<void> _captureFrame() async {
     final provider = _provider;
     final revision = _sourceRevision, session = _session;
@@ -366,6 +454,7 @@ class VrCastHost extends ChangeNotifier {
     if (_disposed) return;
     _disposed = true;
     unawaited(stop());
+    realtime?.dispose();
     _provider = null;
     _source = null;
     super.dispose();

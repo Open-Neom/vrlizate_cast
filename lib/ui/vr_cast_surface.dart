@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
@@ -31,12 +32,17 @@ class VrCastSurface extends StatefulWidget {
     required this.child,
     this.enabled = true,
     this.eye = VrCastEye.left,
+    this.realtimeStereo = true,
   });
 
   final VrCastHost host;
   final Widget child;
   final bool enabled;
   final VrCastEye eye;
+
+  /// The native screen capture includes both eyes. JPEG's selected eye is
+  /// independent of this full-screen video layout.
+  final bool realtimeStereo;
 
   @override
   State<VrCastSurface> createState() => _VrCastSurfaceState();
@@ -47,31 +53,123 @@ class _VrCastSurfaceState extends State<VrCastSurface>
   final GlobalKey _key = GlobalKey();
   VrCastSourceHandle? _handle;
   bool _foreground = true;
+  bool _holdingConsentTransition = false;
+  bool _consentResolved = false;
+  bool _syncing = false;
+  Timer? _consentDeadline;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    widget.host.realtime?.addListener(_onConsentChanged);
     final state = WidgetsBinding.instance.lifecycleState;
     _foreground = state == null || state == AppLifecycleState.resumed;
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
     _sync();
   }
 
   void _sync() {
-    if (widget.enabled && _foreground) {
-      _handle ??= widget.host.registerSource(_capture);
+    if (_syncing) return;
+    _syncing = true;
+    try {
+      _syncSource();
+    } finally {
+      _syncing = false;
+    }
+  }
+
+  void _onConsentChanged() {
+    if (mounted && _handle != null) _sync();
+  }
+
+  void _clearConsentTransition() {
+    _holdingConsentTransition = false;
+    _consentResolved = false;
+    _consentDeadline?.cancel();
+    _consentDeadline = null;
+  }
+
+  void _expireConsentTransition() {
+    _clearConsentTransition();
+    final handle = _handle;
+    _handle = null;
+    if (handle != null) widget.host.unregisterSource(handle);
+  }
+
+  void _syncSource() {
+    // ReplayKit may temporarily make this current route inactive while its
+    // system consent alert is visible. Retain only an EXISTING lease for that
+    // handshake. A private route, disposal or real background always revokes
+    // the stream before its frames can be offered to a viewer.
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    final currentRoute = ModalRoute.isCurrentOf(context) ?? true;
+    final canRetainConsent =
+        _handle != null &&
+        currentRoute &&
+        (lifecycle == AppLifecycleState.inactive ||
+            lifecycle == AppLifecycleState.resumed);
+    if (!canRetainConsent) {
+      _clearConsentTransition();
+    } else {
+      if (!_holdingConsentTransition &&
+          lifecycle == AppLifecycleState.inactive &&
+          widget.host.isAwaitingScreenCaptureConsent) {
+        _holdingConsentTransition = true;
+        // Native permission admission is bounded at 45s. Keep this local
+        // transition bounded too if no lifecycle callback ever follows it.
+        _consentDeadline = Timer(
+          const Duration(seconds: 48),
+          _expireConsentTransition,
+        );
+      }
+      if (_holdingConsentTransition &&
+          !_consentResolved &&
+          !widget.host.isAwaitingScreenCaptureConsent) {
+        _consentResolved = true;
+        _consentDeadline?.cancel();
+        _consentDeadline = Timer(
+          const Duration(seconds: 2),
+          _expireConsentTransition,
+        );
+      }
+      if (_holdingConsentTransition &&
+          lifecycle == AppLifecycleState.resumed &&
+          _foreground &&
+          widget.enabled) {
+        _clearConsentTransition();
+      }
+    }
+    // Resolving getDisplayMedia can precede Flutter's resumed notification.
+    // Retain the same lease through that short handoff, even if the enclosing
+    // experience rebuilt inactive; never admit a fresh source in that state.
+    final consentTransition = canRetainConsent && _holdingConsentTransition;
+    if ((widget.enabled && _foreground && currentRoute) || consentTransition) {
+      _handle ??= widget.host.registerSource(
+        _capture,
+        realtimeStereo: widget.realtimeStereo,
+      );
     } else if (_handle case final handle?) {
-      widget.host.unregisterSource(handle);
       _handle = null;
+      widget.host.unregisterSource(handle);
     }
   }
 
   @override
   void didUpdateWidget(VrCastSurface oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.host != widget.host || oldWidget.eye != widget.eye) {
+    if (oldWidget.host != widget.host ||
+        oldWidget.eye != widget.eye ||
+        oldWidget.realtimeStereo != widget.realtimeStereo) {
+      oldWidget.host.realtime?.removeListener(_onConsentChanged);
+      _clearConsentTransition();
       if (_handle != null) oldWidget.host.unregisterSource(_handle!);
       _handle = null;
+      widget.host.realtime?.addListener(_onConsentChanged);
     }
     _sync();
   }
@@ -120,6 +218,8 @@ class _VrCastSurfaceState extends State<VrCastSurface>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    widget.host.realtime?.removeListener(_onConsentChanged);
+    _clearConsentTransition();
     if (_handle != null) widget.host.unregisterSource(_handle!);
     super.dispose();
   }

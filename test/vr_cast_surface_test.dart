@@ -8,7 +8,10 @@ import 'package:vrlizate_cast/vrlizate_cast.dart';
 class CaptureHost extends VrCastHost {
   VrCastFrameProvider? capture;
   @override
-  VrCastSourceHandle registerSource(VrCastFrameProvider provider) {
+  VrCastSourceHandle registerSource(
+    VrCastFrameProvider provider, {
+    bool realtimeStereo = true,
+  }) {
     capture = provider;
     return super.registerSource(provider);
   }
